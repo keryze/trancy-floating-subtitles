@@ -1,0 +1,1 @@
+# trancy-floating-subtitles
