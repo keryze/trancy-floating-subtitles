@@ -1,0 +1,17 @@
+{
+  "manifest_version": 3,
+  "name": "Trancy 字幕浮窗",
+  "version": "1.2.0",
+  "minimum_chrome_version": "116",
+  "description": "把 YouTube 上的 Trancy 双语字幕同步到置顶浮窗，调整双语字号并控制播放。非 Trancy 官方扩展。",
+  "permissions": ["storage"],
+  "action": {
+    "default_title": "Trancy 字幕浮窗",
+    "default_popup": "popup.html"
+  },
+  "content_scripts": [{
+    "matches": ["https://www.youtube.com/*", "https://youtube.com/*"],
+    "js": ["reader.js", "content.js"],
+    "run_at": "document_idle"
+  }]
+}
