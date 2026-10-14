@@ -5,18 +5,23 @@
 
   const reader = globalThis.TrancyFloatReader;
   const sizeKeys = ['originalSize', 'translationSize'];
-  const defaults = { originalSize: 30, translationSize: 24, compactMode: false };
+  const defaults = { originalSize: 30, translationSize: 24, subtitleGap: 12, windowWidth: 1000, compactMode: false };
   let settings = { ...defaults };
   let pip = null, ui = null, opening = false, video = null;
   let observer = null, heartbeat = null;
+  let nativeCaptionsRequested = false;
   let launcher = null, launcherRoot = null, toastTimer = null;
   let pageKey = location.href, storedError = false;
   const observedTargets = new Set();
   const clamp = (value, fallback) => Number.isFinite(Number(value)) ? Math.max(14, Math.min(72, Math.round(Number(value)))) : fallback;
+  const bounded = (value, fallback, min, max) => value !== null && value !== '' && Number.isFinite(Number(value))
+    ? Math.max(min, Math.min(max, Math.round(Number(value)))) : fallback;
 
-  chrome.storage.local.get(defaults).then(saved => {
+  const settingsReady = chrome.storage.local.get(defaults).then(saved => {
     settings.originalSize = clamp(saved.originalSize, defaults.originalSize);
     settings.translationSize = clamp(saved.translationSize, defaults.translationSize);
+    settings.subtitleGap = bounded(saved.subtitleGap, defaults.subtitleGap, 0, 80);
+    settings.windowWidth = bounded(saved.windowWidth, defaults.windowWidth, 240, 1920);
     settings.compactMode = saved.compactMode === true;
     applySize();
     applyCompactMode();
@@ -36,7 +41,7 @@
   function setText(el, text) { if (el && el.textContent !== text) el.textContent = text; }
 
   const css = `
-    :root {color-scheme:dark; --original-size:30px; --translation-size:24px}
+    :root {color-scheme:dark; --original-size:30px; --translation-size:24px; --subtitle-gap:12px}
     * {box-sizing:border-box}
     body {margin:0;background:#10141d;color:#f4f7fb;font-family:"Segoe UI","Microsoft YaHei",sans-serif;height:100vh;display:flex;flex-direction:column;position:relative}
     .tf-controls {position:absolute;z-index:2;transition:opacity .15s ease}
@@ -47,7 +52,7 @@
     button:disabled {opacity:.45;cursor:default}
     #tf-play {min-width:80px;background:#77dcc6;color:#102722;border-color:#77dcc6;font-weight:700}
     #tf-time {font-size:12px;color:#aab8cc;font-variant-numeric:tabular-nums;white-space:nowrap}
-    main {flex:1;min-height:0;overflow:auto;padding:10px 24px;display:flex;flex-direction:column;justify-content:safe center;gap:12px;text-align:center}
+    main {flex:1;min-height:0;overflow:auto;padding:10px 24px;display:flex;flex-direction:column;justify-content:safe center;gap:var(--subtitle-gap);text-align:center}
     #tf-original {font-size:var(--original-size);line-height:1.45;font-weight:600;white-space:pre-wrap;overflow-wrap:anywhere}
     #tf-translation {font-size:var(--translation-size);line-height:1.5;color:#8fe1cc;white-space:pre-wrap;overflow-wrap:anywhere}
     #tf-empty {font-size:15px;color:#9cabbe;line-height:1.65}
@@ -58,6 +63,8 @@
     .sizes {position:absolute;left:0;bottom:30px;display:grid;grid-template-columns:auto 1fr auto;align-items:center;gap:8px 12px;padding:12px;min-width:260px;max-height:calc(100vh - 40px);overflow:auto;background:#17202e;border:1px solid #3b475b;border-radius:8px}
     input {accent-color:#77dcc6;min-width:80px;width:100%}
     output {min-width:34px;text-align:right;font-variant-numeric:tabular-nums}
+    #tf-windowWidth {background:#10141d;color:#f4f7fb;border:1px solid #3b475b;border-radius:4px;padding:4px}
+    #tf-width-status {grid-column:1/-1;max-width:300px;line-height:1.5}
     #tf-compact[aria-pressed="true"] {color:#9af0d9;border-color:#77dcc6;background:#173d36}
     body.compact:not(:hover):not(.keyboard-controls) .tf-controls {opacity:0;visibility:hidden;pointer-events:none}
     @media(prefers-reduced-motion:reduce) {.tf-controls {transition:none}}
@@ -96,22 +103,43 @@
     const footer = element(doc, 'footer', { class: 'tf-controls' });
     const status = element(doc, 'span', { id: 'tf-status', role: 'status' }, '正在连接视频');
     const details = element(doc, 'details');
-    details.append(element(doc, 'summary', {}, '分别调整字号'));
+    details.append(element(doc, 'summary', {}, '字幕与宽度设置'));
     const sizes = element(doc, 'div', { class: 'sizes' });
     const inputs = {}, outputs = {};
-    for (const [key, label] of [['originalSize', '原文'], ['translationSize', '译文']]) {
+    for (const [key, label, min, max] of [['originalSize', '原文字号', 14, 72], ['translationSize', '译文字号', 14, 72], ['subtitleGap', '双语间距', 0, 80]]) {
       const id = `tf-${key}`;
-      const input = element(doc, 'input', { id, type: 'range', min: '14', max: '72', step: '1', 'aria-label': `${label}字号` });
+      const input = element(doc, 'input', { id, type: 'range', min: String(min), max: String(max), step: '1', 'aria-label': label });
       const output = element(doc, 'output', { for: id });
       input.addEventListener('input', () => { settings[key] = Number(input.value); applySize(); });
       input.addEventListener('change', saveSettings);
       sizes.append(element(doc, 'label', { for: id }, label), input, output);
       inputs[key] = input; outputs[key] = output;
     }
+    const widthInput = element(doc, 'input', { id: 'tf-windowWidth', type: 'number', min: '240', max: '1920', step: '1', 'aria-label': '目标窗口宽度（px）' });
+    widthInput.value = String(settings.windowWidth);
+    const applyWidth = button(doc, '应用', '应用窗口宽度', () => {
+      settings.windowWidth = bounded(widthInput.value, defaults.windowWidth, 240, 1920);
+      widthInput.value = String(settings.windowWidth);
+      saveSettings();
+      try {
+        // resizeTo uses the outer window size. Chrome still enforces its own cap.
+        win.resizeTo(settings.windowWidth, win.outerHeight);
+        win.setTimeout(() => updateWidthStatus(win), 250);
+      } catch {
+        setText(widthStatus, 'Chrome 未允许调整宽度；请尝试拖动窗口边缘。');
+      }
+    });
+    widthInput.addEventListener('keydown', event => {
+      if (event.key === 'Enter') { event.preventDefault(); applyWidth.click(); }
+    });
+    const widthStatus = element(doc, 'span', { id: 'tf-width-status', role: 'status' });
+    sizes.append(element(doc, 'label', { for: 'tf-windowWidth' }, '窗口宽度'), widthInput, applyWidth, widthStatus);
     details.append(sizes);
     footer.append(details);
     doc.body.append(main, modeControl, footer, header, status);
-    ui = { original, translation, empty, status, time, play, rewind, forward, inputs, outputs, compact };
+    ui = { original, translation, empty, status, time, play, rewind, forward, inputs, outputs, compact, widthStatus };
+    win.addEventListener('resize', () => updateWidthStatus(win));
+    updateWidthStatus(win);
     doc.addEventListener('keydown', event => {
       // Reveal controls before the browser moves keyboard focus with Tab.
       if (event.key === 'Tab') doc.body.classList.add('keyboard-controls');
@@ -143,10 +171,17 @@
     if (!pip || pip.closed || !ui) return;
     pip.document.documentElement.style.setProperty('--original-size', `${settings.originalSize}px`);
     pip.document.documentElement.style.setProperty('--translation-size', `${settings.translationSize}px`);
-    for (const key of sizeKeys) {
+    pip.document.documentElement.style.setProperty('--subtitle-gap', `${settings.subtitleGap}px`);
+    for (const key of [...sizeKeys, 'subtitleGap']) {
       ui.inputs[key].value = String(settings[key]);
       setText(ui.outputs[key], `${settings[key]} px`);
     }
+  }
+  function updateWidthStatus(win) {
+    if (!ui || win.closed || win !== pip) return;
+    const actual = Math.round(win.outerWidth);
+    const limited = actual < settings.windowWidth - 2;
+    setText(ui.widthStatus, `实际宽度 ${actual} px${limited ? `，目标 ${settings.windowWidth} px 未达到。` : '。'}Chrome 上限约为屏幕宽度的 80%，填写 1920 无法绕过此限制。`);
   }
   function saveSettings() {
     chrome.storage.local.set(settings).catch(() => {
@@ -204,24 +239,35 @@
     bindVideo();
     const ad = !!document.querySelector('#movie_player.ad-showing, #movie_player.ad-interrupting');
     const result = ad ? { original: '', translation: '', found: true } : reader.read(document);
+    if (!ad) {
+      if (result.trancyActive) nativeCaptionsRequested = false;
+      else if (!nativeCaptionsRequested) {
+        const cc = document.querySelector('#movie_player .ytp-subtitles-button');
+        if (cc && !cc.disabled && cc.getAttribute('aria-disabled') !== 'true') {
+          // Try once when entering native mode. Do not fight manual CC changes.
+          nativeCaptionsRequested = true;
+          if (cc.getAttribute('aria-pressed') === 'false') cc.click();
+        }
+      }
+    }
     // Clear disappeared captions immediately; never leave an old line on screen.
     setText(ui.original, result.original);
     setText(ui.translation, result.translation);
     ui.original.hidden = !result.original;
     ui.translation.hidden = !result.translation;
     ui.empty.hidden = !!(result.original || result.translation);
-    setText(ui.empty, ad ? '广告播放中，等待正片…' : result.found ? '当前没有字幕，等待下一句…' : '请在 YouTube 开启 Trancy 双语字幕。\n保持视频页面打开，即可最小化浏览器。');
+    setText(ui.empty, ad ? '广告播放中，等待正片…' : result.found ? '当前没有字幕，等待下一句…' : '请开启 YouTube 字幕（CC）或 Trancy 双语字幕。\n视频需要有可用字幕。');
     setText(ui.play, video && !video.paused && !video.ended ? '暂停' : '播放');
     for (const control of [ui.play, ui.rewind, ui.forward]) control.disabled = !video;
     setText(ui.time, formatTime(video?.currentTime));
-    setText(ui.status, storedError ? '设置仅本次有效；请刷新页面后重试' : !video ? '未找到 YouTube 视频' : ad ? '广告中' : result.source ? `${result.source} · ${video.paused ? '已暂停' : '同步中'}` : '等待 Trancy');
+    setText(ui.status, storedError ? '设置仅本次有效；请刷新页面后重试' : !video ? '未找到 YouTube 视频' : ad ? '广告中' : result.source ? `${result.source} · ${video.paused ? '已暂停' : '同步中'}` : '等待字幕');
   }
 
   function observeCaptions() {
     if (!observer) return;
     const targets = new Set();
     for (const root of reader.rootsOf(document)) {
-      for (const target of root.querySelectorAll('trancy-caption-window, trancy-app, .trancy-subtitle-container')) targets.add(target);
+      for (const target of root.querySelectorAll('trancy-caption-window, trancy-app, .trancy-subtitle-container, #movie_player .ytp-caption-window-container, #movie_player .ytp-subtitles-button')) targets.add(target);
       if (root !== document) targets.add(root);
     }
     // Reconnect when React replaces a host; discard detached observer targets.
@@ -229,7 +275,7 @@
       observer.disconnect(); observedTargets.clear();
     }
     for (const target of targets) if (!observedTargets.has(target)) {
-      observer.observe(target, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['class', 'style', 'hidden', 'aria-hidden'] });
+      observer.observe(target, { childList: true, subtree: true, characterData: true, attributes: true, attributeFilter: ['class', 'style', 'hidden', 'aria-hidden', 'aria-pressed'] });
       observedTargets.add(target);
     }
   }
@@ -239,6 +285,7 @@
     observer?.disconnect(); observer = null; observedTargets.clear();
     if (video) for (const name of ['timeupdate', 'play', 'pause', 'ended', 'seeked', 'loadedmetadata', 'emptied']) video.removeEventListener(name, sync);
     video = null; ui = null; pip = null;
+    nativeCaptionsRequested = false;
     if (launcherRoot) setText(launcherRoot.querySelector('button'), '字幕浮窗');
   }
   async function openPip() {
@@ -247,7 +294,8 @@
     if (!window.documentPictureInPicture) { showToast('需要桌面版 Chrome 116 或以上版本'); return false; }
     opening = true;
     try {
-      pip = await window.documentPictureInPicture.requestWindow({ width: 1000, height: 160 });
+      await settingsReady;
+      pip = await window.documentPictureInPicture.requestWindow({ width: settings.windowWidth, height: 160 });
       buildWindow(pip);
       pip.addEventListener('pagehide', stopSync, { once: true });
       observer = new MutationObserver(sync);

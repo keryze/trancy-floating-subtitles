@@ -1,4 +1,4 @@
-/* Local DOM adapter for Trancy 7.9.4. No access to Trancy accounts or internals. */
+/* Local caption DOM adapters. No access to accounts or private player APIs. */
 (() => {
   'use strict';
   const normalize = text => String(text || '').replace(/\s+/gu, ' ').trim();
@@ -45,27 +45,53 @@
 
   function read(doc) {
     const roots = rootsOf(doc);
-    let found = false;
+    let trancyActive = false;
     for (const root of roots) {
       for (const box of root.querySelectorAll('.trancy-caption-content')) {
-        found = true;
         if (!visible(box)) continue;
+        trancyActive = true;
         const original = textOf(box.querySelector('.trancy-caption-primary'));
         const translatedElement = box.querySelector('.trancy-caption-secondary');
         const translation = translatedElement?.matches('.ai-loading, .error') ? '' : textOf(translatedElement);
-        if (original || translation) return { original, translation, source: 'Trancy 双语字幕', found: true };
+        if (original || translation) return { original, translation, source: 'Trancy 双语字幕', found: true, trancyActive: true };
       }
       // Learning/reading mode contains many sentences: read only the active one.
       for (const row of root.querySelectorAll('.trancy-subtitle-wrapper.active')) {
-        found = true;
         if (!visible(row)) continue;
+        trancyActive = true;
         const original = textOf(row.querySelector('.trancy-primary-subtitle'));
         const translation = textOf(row.querySelector('.trancy-secondary-subtitle'));
-        if (original || translation) return { original, translation, source: 'Trancy 学习模式', found: true };
+        if (original || translation) return { original, translation, source: 'Trancy 学习模式', found: true, trancyActive: true };
       }
-      found ||= !!root.querySelector('trancy-caption-window, trancy-app, .trancy-subtitle-container');
+      trancyActive ||= [...root.querySelectorAll('.trancy-subtitle-container')].some(visible);
     }
-    return { original: '', translation: '', source: '', found };
+    // A visible but temporarily empty Trancy box still owns the subtitles.
+    // Hidden/leftover hosts alone must not block the native fallback.
+    if (trancyActive) return { original: '', translation: '', source: 'Trancy 双语字幕', found: true, trancyActive: true };
+    return readYouTube(doc);
+  }
+
+  function readYouTube(doc) {
+    const player = doc.querySelector('#movie_player');
+    const cc = player?.querySelector('.ytp-subtitles-button');
+    const enabled = cc?.getAttribute('aria-pressed');
+    const lines = [];
+    // Respect CC being switched off, even if YouTube retains stale caption DOM.
+    if (enabled !== 'false') {
+      for (const box of player?.querySelectorAll('.ytp-caption-window-container .captions-text') || []) {
+        if (!visible(box)) continue;
+        const visualLines = box.querySelectorAll('.caption-visual-line');
+        const candidates = visualLines.length ? visualLines : [box];
+        for (const line of candidates) {
+          if (!visible(line)) continue;
+          // Keep native whitespace: segments can be partial words, not tokens.
+          const segments = [...line.querySelectorAll('.ytp-caption-segment')].filter(visible);
+          const text = normalize(segments.length ? segments.map(el => el.textContent).join('') : line.textContent);
+          if (text) lines.push(text);
+        }
+      }
+    }
+    return { original: lines.join('\n').slice(0, 12000), translation: '', source: 'YouTube 原生字幕', found: enabled === 'true' || lines.length > 0, trancyActive: false };
   }
   globalThis.TrancyFloatReader = Object.freeze({ read, rootsOf, joinTokens });
 })();

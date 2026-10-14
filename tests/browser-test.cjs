@@ -64,6 +64,44 @@ const server = http.createServer((req, res) => {
     assert.equal(await pipValue('tf-translation'), '我们一起学英语。');
     record('Native Document Picture-in-Picture opens and mirrors both languages');
 
+    for (const gap of [0, 36, 80]) {
+      const actualGap = await page.evaluate(gap => {
+        const win = documentPictureInPicture.window, doc = win.document;
+        const input = doc.getElementById('tf-subtitleGap');
+        input.value = String(gap);
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        return doc.getElementById('tf-translation').getBoundingClientRect().top
+          - doc.getElementById('tf-original').getBoundingClientRect().bottom;
+      }, gap);
+      assert.ok(Math.abs(actualGap - gap) < 1, `Expected ${gap}px gap, got ${actualGap}`);
+      assert.equal(await page.evaluate(() => testStorage.subtitleGap), gap);
+    }
+    record('Bilingual gap changes real text geometry at 0, 36 and 80px and saves');
+
+    await page.evaluate(() => {
+      const doc = documentPictureInPicture.window.document;
+      doc.getElementById('tf-windowWidth').value = '1920';
+      doc.querySelector('[aria-label="应用窗口宽度"]').click();
+    });
+    await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-width-status').textContent.includes('目标 1920'));
+    assert.equal(await page.evaluate(() => testStorage.windowWidth), 1920);
+    const widthProbe = await page.evaluate(() => ({
+      screenWidth: screen.width,
+      actualWidth: documentPictureInPicture.window.outerWidth,
+      message: documentPictureInPicture.window.document.getElementById('tf-width-status').textContent
+    }));
+    console.log('Native 1920px width request:', JSON.stringify(widthProbe));
+    assert.ok(widthProbe.actualWidth < 1920, 'Small test display should enforce a native limit');
+    assert.ok(widthProbe.message.includes(`实际宽度 ${widthProbe.actualWidth} px`));
+    record('1920px request saves target and reports native browser-limited actual width');
+
+    await page.evaluate(() => {
+      const doc = documentPictureInPicture.window.document;
+      const gap = doc.getElementById('tf-subtitleGap');
+      gap.value = '12'; gap.dispatchEvent(new Event('input')); gap.dispatchEvent(new Event('change'));
+    });
+
     await page.evaluate(() => { document.querySelector('.trancy-caption-primary').textContent = 'This is the next sentence.'; document.querySelector('.trancy-caption-secondary').textContent = '这是下一句话。'; });
     await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-translation').textContent === '这是下一句话。');
     record('Mutation-driven subtitle changes');
@@ -92,6 +130,7 @@ const server = http.createServer((req, res) => {
     });
     assert.equal(await page.evaluate(() => documentPictureInPicture.window.document.documentElement.style.getPropertyValue('--original-size')), '32px');
     assert.equal(await page.evaluate(() => testStorage.originalSize), 32);
+    assert.equal(await page.evaluate(() => testStorage.subtitleGap), 12, 'Font shortcuts must not change spacing');
     await page.evaluate(() => {
       const input = documentPictureInPicture.window.document.getElementById('tf-translationSize');
       input.value = '40'; input.dispatchEvent(new Event('input', { bubbles: true })); input.dispatchEvent(new Event('change', { bubbles: true }));
@@ -114,6 +153,99 @@ const server = http.createServer((req, res) => {
     await page.evaluate(() => { document.querySelector('.trancy-caption-content').hidden = true; });
     await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-original').textContent === '');
     record('Hidden/disappeared captions clear immediately');
+
+    await page.evaluate(() => {
+      const player = document.querySelector('#movie_player');
+      const cc = document.createElement('button');
+      cc.className = 'ytp-subtitles-button'; cc.setAttribute('aria-pressed', 'false'); cc.textContent = 'CC';
+      const captions = document.createElement('div');
+      captions.className = 'ytp-caption-window-container'; captions.hidden = true;
+      captions.innerHTML = '<div class="caption-window"><div class="captions-text"><span class="caption-visual-line"><span class="ytp-caption-segment">Hel</span><span class="ytp-caption-segment">lo world.</span></span><br><span class="caption-visual-line"><span class="ytp-caption-segment">Second line.</span></span></div></div>';
+      window.testCCClicks = 0;
+      cc.addEventListener('click', () => {
+        window.testCCClicks++;
+        const on = cc.getAttribute('aria-pressed') !== 'true';
+        cc.setAttribute('aria-pressed', String(on));
+        document.querySelector('.ytp-caption-window-container').hidden = !on;
+      });
+      player.append(cc, captions);
+    });
+    await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-original').textContent === 'Hello world.\nSecond line.');
+    assert.equal(await page.evaluate(() => testCCClicks), 1);
+    assert.equal(await pipValue('tf-translation'), '');
+    assert.equal((await read()).source, 'YouTube 原生字幕');
+    record('Hidden Trancy falls back to native captions, enables CC once, preserves fragments and line breaks');
+
+    await page.evaluate(() => {
+      window.detachedTrancy = document.querySelector('trancy-caption-window');
+      detachedTrancy.remove();
+      document.querySelector('.ytp-caption-segment').textContent = 'Real';
+    });
+    await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-original').textContent === 'Reallo world.\nSecond line.');
+    record('Native caption updates work with Trancy completely absent');
+
+    await page.evaluate(() => {
+      document.querySelector('.ytp-subtitles-button').click();
+      // Retained native caption nodes must not leak text after CC is off.
+      document.querySelector('.ytp-caption-window-container').hidden = false;
+    });
+    await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-original').textContent === '');
+    await page.waitForTimeout(350);
+    assert.equal(await page.evaluate(() => testCCClicks), 2);
+    assert.ok((await pipValue('tf-empty')).includes('YouTube 字幕（CC）'));
+    record('Manual CC off clears retained text and is not repeatedly overridden');
+
+    await page.evaluate(() => {
+      document.querySelector('.ytp-subtitles-button').click();
+      document.querySelector('.captions-text').replaceChildren();
+    });
+    await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-empty').textContent === '当前没有字幕，等待下一句…');
+    assert.equal(await pipValue('tf-original'), '');
+    await page.evaluate(() => {
+      const old = document.querySelector('.ytp-caption-window-container');
+      const replacement = old.cloneNode(false);
+      replacement.innerHTML = '<div class="captions-text"><span class="caption-visual-line"><span class="ytp-caption-segment">Replacement caption</span></span></div>';
+      old.replaceWith(replacement);
+    });
+    await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-original').textContent === 'Replacement caption');
+    record('Native cue gaps clear text and replaced caption containers are rediscovered');
+
+    await page.evaluate(() => document.querySelector('#movie_player').classList.add('ad-showing'));
+    await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-original').textContent === '');
+    await page.evaluate(() => document.querySelector('#movie_player').classList.remove('ad-showing'));
+    await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-original').textContent === 'Replacement caption');
+    record('Advertisements suppress native fallback captions too');
+
+    await page.evaluate(() => {
+      document.querySelector('#movie_player').append(detachedTrancy);
+      document.querySelector('.trancy-caption-content').hidden = false;
+      document.querySelector('.trancy-caption-primary').textContent = 'Trancy is back.';
+      const translated = document.querySelector('.trancy-caption-secondary');
+      translated.classList.remove('ai-loading'); translated.textContent = '双语字幕恢复。';
+    });
+    await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-translation').textContent === '双语字幕恢复。');
+    assert.equal(await pipValue('tf-original'), 'Trancy is back.');
+    await page.evaluate(() => {
+      document.querySelector('.trancy-caption-primary').textContent = '';
+      document.querySelector('.trancy-caption-secondary').textContent = '';
+    });
+    await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-original').textContent === '');
+    assert.equal((await read()).trancyActive, true);
+    record('Trancy resumes priority; empty Trancy cues never mix in native captions');
+
+    await page.evaluate(() => {
+      document.querySelector('.trancy-caption-primary').textContent = 'Trancy active';
+      document.querySelector('.ytp-subtitles-button').click();
+    });
+    await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-original').textContent === 'Trancy active');
+    await page.evaluate(() => { document.querySelector('.trancy-caption-content').hidden = true; });
+    await page.waitForFunction(() => documentPictureInPicture.window.document.getElementById('tf-original').textContent === 'Replacement caption');
+    assert.equal(await page.evaluate(() => testCCClicks), 5);
+    record('Turning Trancy off again re-enters native mode and enables CC once');
+    await page.evaluate(() => {
+      document.querySelector('.ytp-subtitles-button').remove();
+      document.querySelector('.ytp-caption-window-container').remove();
+    });
 
     await page.evaluate(() => {
       const host = document.querySelector('trancy-caption-window'); host.replaceChildren();
@@ -161,6 +293,14 @@ const server = http.createServer((req, res) => {
     });
     fs.mkdirSync(path.join(root, 'test-results'), { recursive: true });
     await preview.screenshot({ path: path.join(root, 'test-results', 'floating-window.png') });
+    await preview.locator('summary').click();
+    const panel = preview.locator('.sizes');
+    assert.ok((await panel.boundingBox()).y >= 0, 'Settings must stay inside a shallow window');
+    await preview.locator('#tf-windowWidth').scrollIntoViewIfNeeded();
+    await preview.screenshot({ path: path.join(root, 'test-results', 'settings-shallow.png') });
+    await preview.setViewportSize({ width: 1040, height: 320 });
+    await preview.screenshot({ path: path.join(root, 'test-results', 'settings.png') });
+    record('Settings panel stays within a shallow window and width controls can be scrolled into view');
     await preview.close();
 
     await page.evaluate(() => documentPictureInPicture.window.document.getElementById('tf-compact').click());
@@ -206,6 +346,9 @@ const server = http.createServer((req, res) => {
     await page.waitForFunction(() => !documentPictureInPicture.window);
     await page.locator('#trancy-float-launcher button').click();
     await page.waitForFunction(() => !!documentPictureInPicture.window?.document.querySelector('#tf-original'));
+    assert.equal(await page.evaluate(() => documentPictureInPicture.window.document.getElementById('tf-windowWidth').value), '1920');
+    assert.equal(await page.evaluate(() => documentPictureInPicture.window.getComputedStyle(documentPictureInPicture.window.document.querySelector('main')).rowGap), '12px');
+    record('Width target and bilingual gap survive closing and reopening');
     assert.equal(await page.evaluate(() => documentPictureInPicture.window.document.documentElement.style.getPropertyValue('--translation-size')), '40px');
     assert.equal(await page.evaluate(() => documentPictureInPicture.window.document.body.classList.contains('compact')), true);
     assert.equal(await page.evaluate(() => documentPictureInPicture.window.document.getElementById('tf-compact').getAttribute('aria-pressed')), 'true');
